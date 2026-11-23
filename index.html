@@ -403,7 +403,16 @@
         <div class="controls-card">
             <div class="header-flex">
                 <h3>⚙️ Design Parameters</h3>
-                <button class="load-example-btn" onclick="loadExample()">⚡ Load Example</button>
+                <div style="display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end;">
+                    <button class="load-example-btn" onclick="loadExample()">⚡ Load Example</button>
+                    <button class="load-example-btn" type="button" onclick="document.getElementById('inputPresetFile').click()">📂 Upload Inputs</button>
+                    <input type="file" id="inputPresetFile" accept=".json,application/json" style="display:none" onchange="importInputPreset(event)">
+                    <button class="load-example-btn" type="button" onclick="document.getElementById('batchPresetFile').click()">📚 Upload Multiple</button>
+                    <input type="file" id="batchPresetFile" accept=".json,application/json" style="display:none" onchange="importBatchPresets(event)">
+                </div>
+            </div>
+            <div id="inputUploadStatus" role="status" aria-live="polite" style="font-size:0.82rem; color:#475569; padding:6px 8px; background:#f8fafc; border-radius:6px;">
+                Upload Inputs loads one design. Upload Multiple runs several designs and lets you export all results in one CSV.
             </div>
 
             <!-- Concrete -->
@@ -676,7 +685,11 @@
                         <!-- Populated by JavaScript -->
                     </tbody>
                 </table>
-                <button class="export-btn" onclick="exportCSV()">⬇️ Export Design CSV</button>
+                <div style="display:flex; gap:10px; flex-wrap:wrap;">
+                    <button class="export-btn" onclick="exportCSV()">⬇️ Export Current Design CSV</button>
+                    <button class="export-btn" id="exportBatchBtn" onclick="exportBatchCSV()" disabled>⬇️ Export All Batch Results CSV</button>
+                </div>
+                <div id="batchResultsStatus" role="status" aria-live="polite" style="font-size:0.85rem; color:#475569; margin-top:8px;">No batch file loaded yet.</div>
             </div>
 
             <!-- Detailed Step-by-Step Calculations Section -->
@@ -748,9 +761,174 @@
             "Extreme": { min_cement: 360, max_wc: 0.40 }
         };
 
-        // Global charts
+        // Global charts and batch calculation results
         let curveChart = null;
         let barChart = null;
+        let batchResults = [];
+        const INPUT_IDS = [
+            "grade", "cementType", "sgCement", "maxCement", "exposure", "supervision",
+            "placingMethod", "slump", "mineralType", "mineralPercent", "sgMineral",
+            "pozzolana", "sgPozzolana", "chemicalType", "spDose", "sgSP", "waterRed",
+            "caType", "maxAgg", "sgCA", "caAbs", "caMoist", "zone", "sgFA", "faAbs", "faMoist"
+        ];
+
+        function applyDesignInputs(inputs) {
+            const invalid = [];
+            let applied = 0;
+            INPUT_IDS.forEach(id => {
+                if (!Object.prototype.hasOwnProperty.call(inputs, id)) return;
+                const field = document.getElementById(id);
+                const value = String(inputs[id]);
+                if (field.tagName === "SELECT" && !Array.from(field.options).some(option => option.value === value)) {
+                    invalid.push(id + " = " + value);
+                    return;
+                }
+                field.value = value;
+                applied++;
+            });
+            return { applied, invalid };
+        }
+
+        function readCurrentInputs() {
+            const values = {};
+            INPUT_IDS.forEach(id => values[id] = document.getElementById(id).value);
+            return values;
+        }
+
+        function csvCell(value) {
+            const str = String(value == null ? "" : value);
+            return '"' + str.replace(/"/g, '""') + '"';
+        }
+
+        function downloadCSV(filename, rows) {
+            const csv = rows.map(row => row.map(csvCell).join(",")).join("\r\n");
+            const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = filename;
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+
+        function importBatchPresets(event) {
+            const file = event.target.files && event.target.files[0];
+            if (!file) return;
+            const status = document.getElementById("batchResultsStatus");
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                const originalInputs = readCurrentInputs();
+                try {
+                    const parsed = JSON.parse(e.target.result);
+                    const designs = Array.isArray(parsed) ? parsed : parsed.designs;
+                    if (!Array.isArray(designs) || designs.length === 0) {
+                        throw new Error('Expected a JSON array or an object with a "designs" array.');
+                    }
+                    batchResults = [];
+                    const errors = [];
+                    designs.forEach((design, index) => {
+                        const inputs = design.inputs || design;
+                        const name = design.name || design.id || `Mix ${index + 1}`;
+                        const applied = applyDesignInputs(inputs);
+                        if (applied.applied === 0) {
+                            errors.push(`${name}: no recognised inputs`);
+                            return;
+                        }
+                        if (applied.invalid.length) errors.push(`${name}: invalid selections ${applied.invalid.join("; ")}`);
+                        runDesign();
+                        const resultRows = Array.from(document.querySelectorAll("#resultBody tr")).map(tr =>
+                            Array.from(tr.querySelectorAll("td")).map(td => td.innerText.replace(/\s+/g, " ").trim())
+                        );
+                        batchResults.push({
+                            name,
+                            inputs: { ...readCurrentInputs() },
+                            targetStrength: document.getElementById("dispTarget").innerText,
+                            waterCementRatio: document.getElementById("dispWC").innerText,
+                            cement: document.getElementById("dispCement").innerText,
+                            water: document.getElementById("dispWater").innerText,
+                            resultRows
+                        });
+                    });
+                    // Restore the single-design screen to its original inputs after batch processing.
+                    applyDesignInputs(originalInputs);
+                    runDesign();
+                    document.getElementById("exportBatchBtn").disabled = batchResults.length === 0;
+                    status.textContent = `✓ ${file.name}: calculated ${batchResults.length} of ${designs.length} mix designs.` +
+                        (errors.length ? ` Check: ${errors.join(" | ")}` : " You can now export all results to one CSV.");
+                    status.style.color = errors.length ? "#92400e" : "#166534";
+                } catch (error) {
+                    applyDesignInputs(originalInputs);
+                    runDesign();
+                    batchResults = [];
+                    document.getElementById("exportBatchBtn").disabled = true;
+                    status.textContent = "Batch upload failed: " + error.message;
+                    status.style.color = "#b91c1c";
+                } finally {
+                    event.target.value = "";
+                }
+            };
+            reader.onerror = function() {
+                status.textContent = "Unable to read the batch JSON file.";
+                event.target.value = "";
+            };
+            reader.readAsText(file);
+        }
+
+        function exportBatchCSV() {
+            if (!batchResults.length) return;
+            const headers = ["Mix Name", ...INPUT_IDS, "Target Mean Strength", "Actual W/C Ratio", "Cement Summary", "Water Summary",
+                "Ingredient", "SSD Mass (kg/m3)", "Field Dry Mass (kg/m3)", "Proportion Ratio"];
+            const rows = [headers];
+            batchResults.forEach(result => {
+                result.resultRows.forEach((cells, i) => {
+                    rows.push([
+                        result.name,
+                        ...INPUT_IDS.map(id => result.inputs[id] ?? ""),
+                        result.targetStrength,
+                        result.waterCementRatio,
+                        result.cement,
+                        result.water,
+                        ...(cells || ["", "", "", ""])
+                    ]);
+                });
+            });
+            downloadCSV("Concrete_Mix_Design_Batch_Results.csv", rows);
+        }
+
+        // Import a complete set of design inputs from a JSON preset file.
+        // All fields are populated first, then runDesign() is called once.
+        function importInputPreset(event) {
+            const file = event.target.files && event.target.files[0];
+            if (!file) return;
+
+            const status = document.getElementById("inputUploadStatus");
+            const reader = new FileReader();
+
+            reader.onload = function(e) {
+                try {
+                    const preset = JSON.parse(e.target.result);
+                    const inputs = preset.inputs || preset;
+                    const { applied, invalid } = applyDesignInputs(inputs);
+
+                    if (applied === 0) throw new Error("No recognised calculator input fields were found in this file.");
+                    runDesign();
+                    status.textContent = `✓ ${file.name} uploaded. ${applied} input fields populated and calculations updated.` +
+                        (invalid.length ? ` Skipped invalid selections: ${invalid.join(", ")}.` : "");
+                    status.style.color = invalid.length ? "#92400e" : "#166534";
+                } catch (error) {
+                    status.textContent = "Upload failed: " + error.message;
+                    status.style.color = "#b91c1c";
+                } finally {
+                    event.target.value = "";
+                }
+            };
+            reader.onerror = function() {
+                status.textContent = "Unable to read the selected file.";
+                status.style.color = "#b91c1c";
+                event.target.value = "";
+            };
+            reader.readAsText(file);
+        }
 
         function loadExample() {
             document.getElementById("grade").value = "M40";
